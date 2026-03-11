@@ -91,6 +91,13 @@ try {
 READVER
 )
 
+# Compute a fingerprint of all patch files so the build is invalidated when patches change.
+PATCHES_DIR="$ELECTRON_ROOT/scripts/patches"
+PATCH_HASH=""
+if [[ -d "$PATCHES_DIR" ]]; then
+  PATCH_HASH=$(cat "$PATCHES_DIR"/*.patch 2>/dev/null | sha256sum | cut -d' ' -f1)
+fi
+
 if [[ -n "$DESIRED_VERSION" && "${OPENCLAW_FORCE_BUILD:-}" != "1" ]]; then
   BUILD_INFO="$OUT_DIR/runtime-build-info.json"
   if [[ -f "$BUILD_INFO" ]]; then
@@ -101,10 +108,20 @@ try {
 } catch {}
 READBI
     )
-    if [[ "$BUILT_VERSION" == "$DESIRED_VERSION" ]]; then
-      echo "[openclaw-runtime] Already built for $DESIRED_VERSION (target=$TARGET_ID), skipping."
+    BUILT_PATCH_HASH=$(node - "$BUILD_INFO" <<'READPH'
+try {
+  const info = require(process.argv[2]);
+  console.log(info.patchHash || '');
+} catch {}
+READPH
+    )
+    if [[ "$BUILT_VERSION" == "$DESIRED_VERSION" && "$BUILT_PATCH_HASH" == "$PATCH_HASH" ]]; then
+      echo "[openclaw-runtime] Already built for $DESIRED_VERSION (target=$TARGET_ID, patchHash=${PATCH_HASH:0:12}…), skipping."
       echo "[openclaw-runtime] Use OPENCLAW_FORCE_BUILD=1 to force rebuild."
       exit 0
+    fi
+    if [[ "$BUILT_VERSION" == "$DESIRED_VERSION" && "$BUILT_PATCH_HASH" != "$PATCH_HASH" ]]; then
+      echo "[openclaw-runtime] Patches changed (was=${BUILT_PATCH_HASH:0:12}…, now=${PATCH_HASH:0:12}…), rebuilding."
     fi
   fi
   echo "[openclaw-runtime] Pinned version: $DESIRED_VERSION (current build: ${BUILT_VERSION:-none})"
@@ -146,7 +163,7 @@ cp -R "$PKG_DIR" "$OUT_DIR"
 
 # Save build metadata for traceability.
 # Use `node -` so stdin is treated as script and the following args remain user args.
-node - "$OUT_DIR" "$OPENCLAW_SRC" "$TARGET_ID" "$ELECTRON_ROOT" <<'NODE'
+node - "$OUT_DIR" "$OPENCLAW_SRC" "$TARGET_ID" "$ELECTRON_ROOT" "$PATCH_HASH" <<'NODE'
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
@@ -154,6 +171,7 @@ const outDir = process.argv[2];
 const src = process.argv[3];
 const target = process.argv[4];
 const electronRoot = process.argv[5];
+const patchHash = process.argv[6] || '';
 
 // Read pinned version from package.json
 let openclawVersion = '';
@@ -178,6 +196,7 @@ const meta = {
   target,
   openclawVersion,
   openclawCommit,
+  patchHash,
 };
 fs.writeFileSync(path.join(outDir, 'runtime-build-info.json'), JSON.stringify(meta, null, 2) + '\n');
 NODE
