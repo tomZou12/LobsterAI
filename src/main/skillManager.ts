@@ -1373,6 +1373,7 @@ export class SkillManager {
       clearTimeout(this.notifyTimer);
     }
     this.notifyTimer = setTimeout(() => {
+      this.notifyTimer = null;
       this.startWatching();
       this.notifySkillsChanged();
     }, WATCH_DEBOUNCE_MS);
@@ -1394,8 +1395,11 @@ export class SkillManager {
     }
   }
 
-  onSkillsChanged(listener: () => void): void {
+  onSkillsChanged(listener: () => void): () => void {
     this.changeListeners.push(listener);
+    return () => {
+      this.changeListeners = this.changeListeners.filter(l => l !== listener);
+    };
   }
 
   private parseSkillDir(

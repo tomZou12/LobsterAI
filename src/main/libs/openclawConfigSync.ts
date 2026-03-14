@@ -53,6 +53,7 @@ export type OpenClawConfigSyncResult = {
   changed: boolean;
   configPath: string;
   error?: string;
+  agentsMdWarning?: string;
 };
 
 type OpenClawConfigSyncDeps = {
@@ -102,7 +103,14 @@ export class OpenClawConfigSync {
       // No API/model configured yet (fresh install).
       // Write a minimal config so the gateway can start — it just won't have
       // any model provider until the user configures one.
-      return this.writeMinimalConfig(configPath, reason);
+      const result = this.writeMinimalConfig(configPath, reason);
+      // Still sync AGENTS.md even when API is not configured — skills/systemPrompt
+      // may already be set and should be available when the user configures a model.
+      const workspaceDir = (coworkConfig.workingDirectory || '').trim();
+      const resolvedWorkspaceDir = workspaceDir || path.join(app.getPath('home'), '.openclaw', 'workspace');
+      const agentsMdWarning = this.syncAgentsMd(resolvedWorkspaceDir, coworkConfig);
+      if (agentsMdWarning) result.agentsMdWarning = agentsMdWarning;
+      return result;
     }
 
     const { baseURL, apiKey, model, apiType } = apiResolution.config;
@@ -454,12 +462,13 @@ export class OpenClawConfigSync {
     // This runs on every sync regardless of openclaw.json changes, because skills
     // may have been installed/enabled/disabled independently.
     const resolvedWorkspaceDir = workspaceDir || path.join(app.getPath('home'), '.openclaw', 'workspace');
-    this.syncAgentsMd(resolvedWorkspaceDir, coworkConfig);
+    const agentsMdWarning = this.syncAgentsMd(resolvedWorkspaceDir, coworkConfig);
 
     return {
       ok: true,
       changed: configChanged,
       configPath,
+      ...(agentsMdWarning ? { agentsMdWarning } : {}),
     };
   }
 
@@ -469,7 +478,7 @@ export class OpenClawConfigSync {
    * native channel connectors (DingTalk, Feishu, etc.) can discover and
    * invoke LobsterAI skills.
    */
-  private syncAgentsMd(workspaceDir: string, coworkConfig: CoworkConfig): void {
+  private syncAgentsMd(workspaceDir: string, coworkConfig: CoworkConfig): string | undefined {
     const MARKER = '<!-- LobsterAI managed: do not edit below this line -->';
 
     try {
@@ -479,73 +488,69 @@ export class OpenClawConfigSync {
       // Build the managed section
       const sections: string[] = [];
 
-      // Add system prompt if configured
-      const systemPrompt = (coworkConfig.systemPrompt || '').trim();
+      // Add system prompt if configured — strip MARKER to prevent content corruption
+      const systemPrompt = (coworkConfig.systemPrompt || '').trim().replaceAll(MARKER, '');
       if (systemPrompt) {
         sections.push(`## System Prompt\n\n${systemPrompt}`);
       }
 
-      // Add skills routing prompt
-      const skillsPrompt = this.getSkillsPrompt?.();
+      // Add skills routing prompt — strip MARKER for safety
+      const skillsPrompt = this.getSkillsPrompt?.()?.replaceAll(MARKER, '') ?? null;
       if (skillsPrompt) {
         sections.push(skillsPrompt);
       }
 
+      // Read existing file once to avoid TOCTOU issues
+      let existingContent = '';
+      try {
+        existingContent = fs.readFileSync(agentsMdPath, 'utf8');
+      } catch {
+        // File doesn't exist yet.
+      }
+
+      // Extract user content (everything before the marker)
+      const markerIdx = existingContent.indexOf(MARKER);
+      const userContent = markerIdx >= 0
+        ? existingContent.slice(0, markerIdx).trimEnd()
+        : existingContent.trimEnd();
+
       if (sections.length === 0) {
-        // No managed content — remove the managed section from AGENTS.md if present,
-        // but don't delete the file (user may have their own content).
-        try {
-          const existing = fs.readFileSync(agentsMdPath, 'utf8');
-          const markerIdx = existing.indexOf(MARKER);
-          if (markerIdx >= 0) {
-            const userContent = existing.slice(0, markerIdx).trimEnd();
-            if (userContent) {
-              fs.writeFileSync(agentsMdPath, userContent + '\n', 'utf8');
-            } else {
-              fs.unlinkSync(agentsMdPath);
+        // No managed content — remove the managed section if present,
+        // but preserve user content.
+        if (markerIdx >= 0) {
+          if (userContent) {
+            const cleaned = userContent + '\n';
+            if (existingContent !== cleaned) {
+              this.atomicWriteFile(agentsMdPath, cleaned);
             }
+          } else {
+            try { fs.unlinkSync(agentsMdPath); } catch { /* already gone */ }
           }
-        } catch {
-          // File doesn't exist or can't be read — nothing to clean up.
         }
         return;
       }
 
       const managedContent = `${MARKER}\n\n${sections.join('\n\n')}`;
-
-      // Preserve user content above the marker
-      let userContent = '';
-      try {
-        const existing = fs.readFileSync(agentsMdPath, 'utf8');
-        const markerIdx = existing.indexOf(MARKER);
-        if (markerIdx >= 0) {
-          userContent = existing.slice(0, markerIdx).trimEnd();
-        } else {
-          // No marker found — entire file is user content
-          userContent = existing.trimEnd();
-        }
-      } catch {
-        // File doesn't exist yet — no user content.
-      }
-
       const nextContent = userContent
         ? `${userContent}\n\n${managedContent}\n`
         : `${managedContent}\n`;
 
       // Only write if content actually changed
-      let currentContent = '';
-      try {
-        currentContent = fs.readFileSync(agentsMdPath, 'utf8');
-      } catch {
-        currentContent = '';
-      }
+      if (existingContent === nextContent) return;
 
-      if (currentContent === nextContent) return;
-
-      fs.writeFileSync(agentsMdPath, nextContent, 'utf8');
+      this.atomicWriteFile(agentsMdPath, nextContent);
     } catch (error) {
-      console.warn('[OpenClawConfigSync] Failed to sync AGENTS.md:', error);
+      const msg = error instanceof Error ? error.message : String(error);
+      console.warn('[OpenClawConfigSync] Failed to sync AGENTS.md:', msg);
+      return msg;
     }
+  }
+
+  /** Atomic file write via tmp + rename, consistent with openclaw.json writes. */
+  private atomicWriteFile(filePath: string, content: string): void {
+    const tmpPath = `${filePath}.tmp-${Date.now()}`;
+    fs.writeFileSync(tmpPath, content, 'utf8');
+    fs.renameSync(tmpPath, filePath);
   }
 
   /**
