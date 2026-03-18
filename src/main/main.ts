@@ -795,9 +795,68 @@ const getOpenClawConfigSync = (): OpenClawConfigSync => {
   return openClawConfigSync;
 };
 
+// Deferred gateway restart: when a config change requires a gateway restart
+// but active cowork sessions exist, we defer the restart until all sessions
+// complete.  A polling interval checks periodically; a hard timeout ensures
+// the restart eventually happens even if a session hangs.
+let deferredRestartTimer: ReturnType<typeof setInterval> | null = null;
+let deferredRestartTimeout: ReturnType<typeof setTimeout> | null = null;
+const DEFERRED_RESTART_POLL_MS = 3_000;
+const DEFERRED_RESTART_MAX_WAIT_MS = 5 * 60_000; // 5 minutes hard cap
+
+const clearDeferredRestart = () => {
+  if (deferredRestartTimer) { clearInterval(deferredRestartTimer); deferredRestartTimer = null; }
+  if (deferredRestartTimeout) { clearTimeout(deferredRestartTimeout); deferredRestartTimeout = null; }
+};
+
+const executeDeferredGatewayRestart = async (reason: string) => {
+  clearDeferredRestart();
+  console.log(`[OpenClaw] executeDeferredGatewayRestart: performing deferred restart (reason: ${reason})`);
+  await syncOpenClawConfig({ reason: `deferred:${reason}`, restartGatewayIfRunning: true });
+};
+
+const scheduleDeferredGatewayRestart = (reason: string) => {
+  // If already scheduled, the latest config is already on disk — just let
+  // the existing timer handle the restart.
+  if (deferredRestartTimer) {
+    console.log(`[OpenClaw] scheduleDeferredGatewayRestart: already scheduled, skipping (reason: ${reason})`);
+    return;
+  }
+
+  deferredRestartTimer = setInterval(() => {
+    if (!openClawRuntimeAdapter?.hasActiveSessions()) {
+      void executeDeferredGatewayRestart(reason);
+    }
+  }, DEFERRED_RESTART_POLL_MS);
+
+  // Hard timeout: restart anyway after max wait to avoid config drift.
+  deferredRestartTimeout = setTimeout(() => {
+    console.warn(`[OpenClaw] scheduleDeferredGatewayRestart: max wait exceeded, forcing restart (reason: ${reason})`);
+    void executeDeferredGatewayRestart(reason);
+  }, DEFERRED_RESTART_MAX_WAIT_MS);
+};
+
 const syncOpenClawConfig = async (
   options: { reason: string; restartGatewayIfRunning?: boolean } = { reason: 'unknown' },
 ): Promise<{ success: boolean; changed: boolean; status?: OpenClawEngineStatus; error?: string }> => {
+  // When a restart would be needed and there are active sessions, defer the
+  // entire sync (including the config file write) to avoid triggering
+  // OpenClaw's built-in file-watcher reload (SIGUSR1) which would kill
+  // in-flight conversations even without our explicit gateway restart.
+  if (options.restartGatewayIfRunning && openClawRuntimeAdapter?.hasActiveSessions()) {
+    const manager = getOpenClawEngineManager();
+    const status = manager.getStatus();
+    if (status.phase === 'running') {
+      console.log(`[OpenClaw] syncOpenClawConfig: deferring entire config sync because active sessions exist (reason: ${options.reason})`);
+      scheduleDeferredGatewayRestart(options.reason);
+      return {
+        success: true,
+        changed: false,
+        status,
+      };
+    }
+  }
+
   const syncResult = getOpenClawConfigSync().sync(options.reason);
   if (!syncResult.ok) {
     const status = getOpenClawEngineManager().setExternalError(
@@ -832,7 +891,7 @@ const syncOpenClawConfig = async (
   // This prevents a race where the old client's async `onClose` fires after a new client
   // has already been created, destroying the new connection.
   if (openClawRuntimeAdapter) {
-    console.log('[OpenClaw] syncOpenClawConfig: pre-emptively disconnecting runtime adapter before gateway restart');
+    console.log(`[OpenClaw] syncOpenClawConfig: pre-emptively disconnecting runtime adapter before gateway restart (reason: ${options.reason})`);
     openClawRuntimeAdapter.disconnectGatewayClient();
   }
 
@@ -1954,6 +2013,15 @@ if (!gotTheLock) {
         imageAttachments: options.imageAttachments,
       }).catch(error => {
         console.error('Cowork session error:', error);
+        // Ensure the renderer is notified so it can clear the streaming state.
+        // Without this, a gateway disconnect (or similar async failure) leaves
+        // the UI permanently stuck in "streaming" mode.
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        const windows = BrowserWindow.getAllWindows();
+        windows.forEach((win) => {
+          if (win.isDestroyed()) return;
+          win.webContents.send('cowork:stream:error', { sessionId: session.id, error: errorMessage });
+        });
       });
 
       const sessionWithMessages = coworkStoreInstance.getSession(session.id) || {
@@ -1996,6 +2064,15 @@ if (!gotTheLock) {
         imageAttachments: options.imageAttachments,
       }).catch(error => {
         console.error('Cowork continue error:', error);
+        // Ensure the renderer is notified so it can clear the streaming state.
+        // Without this, a gateway disconnect (or similar async failure) leaves
+        // the UI permanently stuck in "streaming" mode.
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        const windows = BrowserWindow.getAllWindows();
+        windows.forEach((win) => {
+          if (win.isDestroyed()) return;
+          win.webContents.send('cowork:stream:error', { sessionId: options.sessionId, error: errorMessage });
+        });
       });
 
       const session = getCoworkStore().getSession(options.sessionId);

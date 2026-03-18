@@ -129,8 +129,20 @@ class CoworkService {
     this.streamListenerCleanups.push(completeCleanup);
 
     // Error listener
-    const errorCleanup = cowork.onStreamError(({ sessionId }) => {
+    const errorCleanup = cowork.onStreamError(({ sessionId, error }) => {
       store.dispatch(updateSessionStatus({ sessionId, status: 'error' }));
+      // Surface the error as a visible message so the user knows what happened.
+      if (error) {
+        store.dispatch(addMessage({
+          sessionId,
+          message: {
+            id: `error-${Date.now()}`,
+            type: 'system',
+            content: error,
+            timestamp: Date.now(),
+          },
+        }));
+      }
     });
     this.streamListenerCleanups.push(errorCleanup);
 
